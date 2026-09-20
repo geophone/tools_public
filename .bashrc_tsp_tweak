@@ -1,0 +1,279 @@
+# ============================================================================
+# TMUX + TSP PIPELINED SHELL
+# ============================================================================
+
+[[ $- != *i* ]] && return
+
+export SUDO_ASKPASS=/usr/lib/openssh/gnome-ssh-askpass
+
+
+# Automatically start tmux.
+if [[ -z "${TMUX:-}" && -z "${TSP_PIPELINE_DISABLE:-}" ]]; then
+    if command -v tmux >/dev/null && command -v tsp >/dev/null; then
+        exec tmux new-session
+    fi
+fi
+
+[[ -z "${TMUX:-}" ]] && return
+
+
+# One TSP command at a time.
+tsp -S 1 >/dev/null 2>&1
+
+
+# ============================================================================
+# ROOT-TSP MODE
+# ============================================================================
+
+: "${TSP_ROOT_MODE:=0}"
+: "${TSP_ROOT_KEEPALIVE_PID:=}"
+
+TSP_NORMAL_PS1="${TSP_NORMAL_PS1:-$PS1}"
+
+
+_tsp_prompt()
+{
+    if [[ "$TSP_ROOT_MODE" == 1 ]]; then
+        PS1="\[\e[1;31m\][ROOT-TSP]\[\e[0m\] $TSP_NORMAL_PS1"
+    else
+        PS1="$TSP_NORMAL_PS1"
+    fi
+}
+
+
+_tsp_root_on()
+{
+    [[ "$TSP_ROOT_MODE" == 1 ]] && return
+
+    # Authenticate once in the input pane.
+    sudo -A -v || return 1
+
+    TSP_ROOT_MODE=1
+    _tsp_prompt
+
+    # Keep the global sudo timestamp alive.
+    (
+        while sleep 60; do
+            sudo -n -v >/dev/null 2>&1 || exit
+        done
+    ) &
+
+    TSP_ROOT_KEEPALIVE_PID=$!
+
+    echo
+    echo "ROOT-TSP mode enabled. Type exit to leave."
+    echo
+}
+
+
+_tsp_root_off()
+{
+    if [[ -n "${TSP_ROOT_KEEPALIVE_PID:-}" ]]; then
+        kill "$TSP_ROOT_KEEPALIVE_PID" 2>/dev/null
+        TSP_ROOT_KEEPALIVE_PID=""
+    fi
+
+    TSP_ROOT_MODE=0
+    sudo -k
+    _tsp_prompt
+
+    echo
+    echo "ROOT-TSP mode disabled."
+    echo
+}
+
+
+_tsp_prompt
+
+
+# ============================================================================
+# OUTPUT PANE
+# ============================================================================
+
+TSP_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/tsp-pipeline"
+TSP_WATCHER="$TSP_DIR/watch.sh"
+
+mkdir -p "$TSP_DIR"
+
+cat > "$TSP_WATCHER" <<'EOF'
+#!/usr/bin/env bash
+
+printf '\033[2J\033[H'
+echo "TSP OUTPUT"
+echo "=========="
+echo
+
+declare -A shown
+
+# Ignore jobs that were already complete when this pane started.
+while read -r id state rest; do
+    [[ "$id" =~ ^[0-9]+$ ]] || continue
+
+    case "$state" in
+        running|queued) ;;
+        *) shown["$id"]=1 ;;
+    esac
+done < <(
+    tsp -l 2>/dev/null |
+    awk '$1 ~ /^[0-9]+$/ {print $1, $2}'
+)
+
+while true; do
+    found=0
+
+    while read -r id state; do
+        [[ "$id" =~ ^[0-9]+$ ]] || continue
+        [[ "$state" == "queued" ]] && continue
+        [[ -n "${shown[$id]}" ]] && continue
+
+        echo
+        echo "============================================================"
+        echo " TSP JOB $id"
+        echo "============================================================"
+        echo
+
+        tsp -c "$id"
+
+        shown["$id"]=1
+
+        echo
+        echo "------------------------------------------------------------"
+        echo " JOB $id COMPLETE"
+        echo "------------------------------------------------------------"
+
+        found=1
+        break
+
+    done < <(
+        tsp -l 2>/dev/null |
+        awk '$1 ~ /^[0-9]+$/ {print $1, $2}' |
+        sort -n
+    )
+
+    (( found == 0 )) && sleep 0.1
+done
+EOF
+
+chmod +x "$TSP_WATCHER"
+
+
+# Create bottom output pane once.
+if [[ "$(tmux show-option -wqv @tsp_ready)" != 1 ]]; then
+    input_pane="$TMUX_PANE"
+
+    output_pane="$(
+        tmux split-window \
+            -v \
+            -d \
+            -P \
+            -F '#{pane_id}' \
+            -c "$PWD" \
+            bash --noprofile --norc "$TSP_WATCHER"
+    )"
+
+    if [[ -n "$output_pane" ]]; then
+        tmux set-option -wq @tsp_ready 1
+        tmux select-pane -t "$output_pane" -T "TSP OUTPUT"
+        tmux select-pane -t "$input_pane" -T "TSP INPUT"
+        tmux select-pane -t "$input_pane"
+    fi
+fi
+
+
+# ============================================================================
+# ENTER -> TSP
+# ============================================================================
+
+_tsp_enter()
+{
+    local cmd="$READLINE_LINE"
+    local jid
+    local rc
+    local sudo_cmd
+
+    READLINE_LINE=""
+    READLINE_POINT=0
+
+    [[ -z "${cmd//[[:space:]]/}" ]] && return
+
+    history -s "$cmd"
+    printf '\n'
+
+
+    # sudo -s / sudo -i -> ROOT-TSP mode.
+    if [[ "$cmd" =~ ^[[:space:]]*sudo[[:space:]]+(-s|-i)[[:space:]]*$ ]]; then
+        _tsp_root_on
+        return
+    fi
+
+
+    # exit -> leave ROOT-TSP mode.
+    if [[ "$TSP_ROOT_MODE" == 1 &&
+          "$cmd" =~ ^[[:space:]]*(exit|logout)[[:space:]]*$ ]]; then
+        _tsp_root_off
+        return
+    fi
+
+
+    # Everything entered in ROOT-TSP mode runs as root.
+    if [[ "$TSP_ROOT_MODE" == 1 ]]; then
+        jid="$(tsp sudo -n bash -c "$cmd")"
+        rc=$?
+
+        if (( rc == 0 )); then
+            echo "[queued ROOT TSP job $jid]"
+        else
+            echo "[failed to queue ROOT TSP job]"
+        fi
+
+        return "$rc"
+    fi
+
+
+    # ------------------------------------------------------------------------
+    # Normal sudo command
+    #
+    # Authenticate BEFORE putting it into TSP.
+    #
+    # Example:
+    #
+    #     sudo apt-get update
+    #
+    # becomes:
+    #
+    #     sudo -A -v
+    #     tsp bash -c 'sudo -n apt-get update'
+    #
+    # ------------------------------------------------------------------------
+
+    if [[ "$cmd" =~ ^[[:space:]]*sudo[[:space:]]+(.*)$ ]]; then
+        sudo_cmd="${BASH_REMATCH[1]}"
+
+        # Authenticate in this top/input shell.
+        sudo -A -v || return 1
+
+        # TSP command must never try to prompt.
+        cmd="sudo -n $sudo_cmd"
+    fi
+
+
+    # Normal queued command.
+    jid="$(tsp bash -c "$cmd")"
+    rc=$?
+
+    if (( rc == 0 )); then
+        echo "[queued TSP job $jid]"
+    else
+        echo "[failed to queue TSP job]"
+    fi
+
+    return "$rc"
+}
+
+
+# Enter queues.
+bind -x '"\C-m":_tsp_enter'
+
+# Ctrl-J executes directly in this Bash shell.
+# Use for: cd, export, source, alias, tsp, etc.
+bind '"\C-j":accept-line'
