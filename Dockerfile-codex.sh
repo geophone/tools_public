@@ -3,4 +3,4 @@ docker run --rm -it \
   --security-opt=no-new-privileges \
   -v "$PWD:/workspace" \
   -v codex-home:/home/codex/.codex \
-  codex-universal
+  codex-saved # custom image
